@@ -26,6 +26,6 @@ This will install all the required Python packages to run this code (installatio
 The EEG dataset is not publicly available due to privacy concerns.
 
 ## Demo for detect lie
-
+It's soon as possible
 
 The README files within each folder provide further information.
