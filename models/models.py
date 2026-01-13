@@ -71,8 +71,7 @@ class MoE(nn.Module):
             exploration_weight: Weight for load balancing regularization
         """
         super(MoE, self).__init__()
-        MLP_expert = MLP(d_model)
-        self.experts = nn.ModuleList([MLP_expert for _ in range(num_experts)])
+        self.experts = nn.ModuleList([MLP(d_model) for _ in range(num_experts)])
         self.gating = nn.Linear(d_model, num_experts)  # Gating network to select experts
         self.num_experts = num_experts
         self.k = k  # Number of top experts to activate
