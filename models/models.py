@@ -6,114 +6,26 @@ import numpy as np
 import pandas as pd
 from mamba_ssm import Mamba
 
-class BiMambaEncoder(nn.Module):
-    def __init__(self, d_model, n_state):
-        super(BiMambaEncoder, self).__init__()
-        self.d_model = d_model
-        
-        self.mamba = Mamba(d_model, n_state)
-
-        # Norm and feed-forward network layer
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.feed_forward = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
-            nn.Linear(d_model * 4, d_model)
-        )
-
-    def forward(self, x):
-        # Residual connection of the original input
-        residual = x
-        
-        # Forward Mamba
-        x_norm = self.norm1(x)
-        mamba_out_forward = self.mamba(x_norm)
-
-        # Backward Mamba
-        x_flip = torch.flip(x_norm, dims=[1])  # Flip Sequence
-        mamba_out_backward = self.mamba(x_flip)
-        mamba_out_backward = torch.flip(mamba_out_backward, dims=[1])  # Flip back
-
-        # Combining forward and backward
-        mamba_out = mamba_out_forward + mamba_out_backward
-        
-        mamba_out = self.norm2(mamba_out)
-        ff_out = self.feed_forward(mamba_out)
-
-        output = ff_out + residual
-        return output
-
-class MLP(nn.Module):
-    def __init__(self, d_model):
-        super().__init__() # Define the model layers
-        self.fc1 = nn.Linear(d_model, 256, bias=True)
-        self.fc2 = nn.Linear(256, 256, bias=True) 
-        self.fc3 = nn.Linear(256, d_model, bias=True) 
-        self.dropout = nn.Dropout(0.25) 
-
-
-    def forward(self, x): # Define the forward pass sequence
-        x = F.relu(self.fc1(x))
-        x = self.dropout(F.relu(self.fc2(x))) 
-        x = F.relu(self.fc3(x))
-      
-        return x
-# Mixture of Experts (MoE) Layer Implementation
-class MoE(nn.Module):
-    def __init__(self, d_model, num_experts, k=1, exploration_weight=0.02):
-        """
-        Mixture of Experts layer with Top-K Gating and Load Balancing Regularization.
-        Args:
-            d_model: Input dimension
-            num_experts: Number of experts
-            k: Number of top experts to activate
-            exploration_weight: Weight for load balancing regularization
-        """
-        super(MoE, self).__init__()
-        MLP_expert = MLP(d_model)
-        self.experts = nn.ModuleList([MLP_expert for _ in range(num_experts)])
-        self.gating = nn.Linear(d_model, num_experts)  # Gating network to select experts
-        self.num_experts = num_experts
-        self.k = k  # Number of top experts to activate
-        self.exploration_weight = exploration_weight  # Regularization weight
-
-    def forward(self, x):
-        # Compute gating weights
-        gates = torch.softmax(self.gating(x), dim=-1)  # Shape: (..., num_experts)
-
-        # Select Top-K experts
-        _, top_k_indices = torch.topk(gates, self.k, dim=-1)  # Top-K expert indices
-        top_k_gates = torch.zeros_like(gates).scatter_(-1, top_k_indices, gates.gather(-1, top_k_indices))  # Mask for Top-K gates
-
-        # Compute expert outputs
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=-1)  # Shape: (..., d_model, num_experts)
-
-        # Combine expert outputs based on Top-K gating weights
-        output = torch.einsum('...nde,...ne->...nd', expert_outputs, top_k_gates)  # Weighted sum with Top-K gates
-
-        # Add exploration loss for load balancing
-        avg_gates = gates.mean(dim=0)  # Average gating weights across batch
-        load_balancing_loss = (avg_gates * torch.log(avg_gates + 1e-6)).sum() / self.num_experts  # Entropy-based loss
-        self.load_balancing_loss = -self.exploration_weight * load_balancing_loss  # Minimize imbalance
-
-        return output
-    
 class SparseMambaNet(nn.Module):
+    """
+    SparseMambaNet: A hybrid architecture combining Bi-Directional Mamba 
+    for temporal modeling and Mixture of Experts (MoE) for efficient feature extraction.
+    """
     def __init__(self, args):
         """
+        Initialize the SparseMambaNet model.
+
         Args:
-            input_dim: Dimension of input features
-            d_model: Model dimension for Mamba2
-            d_state: SSM state expansion factor for Mamba2
-            d_conv: Local convolution width for Mamba2
-            expand: Block expansion factor for Mamba2
-            n_layers: Number of Mamba2 layers to stack
-            num_experts: Number of experts in MoE
-            num_classes: Number of output classes
+            args: Argument parser object containing model hyperparameters.
+                - input_dim: Dimension of input features (e.g., number of EEG channels).
+                - d_model: Hidden dimension size for the Mamba model.
+                - d_state: SSM state expansion factor.
+                - num_experts: Number of experts in the MoE layer.
+                - num_classes: Number of output classes for classification.
+                - n_layers: Number of Mamba-MoE blocks to stack.
         """
         super(SparseMambaNet, self).__init__()
-         
+          
         self.input_dim = args.input_dim
         self.d_model = args.d_model
         self.d_state = args.d_state
@@ -123,36 +35,160 @@ class SparseMambaNet(nn.Module):
         self.num_experts = args.num_experts
         self.num_classes = args.num_classes
         
-        # Initial projection layer to project input to d_model
+        # 1. Input Projection
+        # LINEAR: Projects the raw input features to the model's hidden dimension (d_model).
         self.input_projection = nn.Linear(self.input_dim, self.d_model)
         
-        # Layer Normalization as the first layer
+        # Layer Normalization applied immediately after projection (Pre-Norm architecture).
         self.layer_norm = nn.LayerNorm(self.d_model)
         
-        # Stack n Mamba layers
+        # 2. Stacked Mamba-MoE Layers
+        # Constructs a sequence of blocks where each block contains a Bi-Mamba encoder and an MoE module.
         self.mamba_layers = nn.ModuleList([
-            BiMambaEncoder(d_model = self.d_model, n_state = self.d_state)
+            SparseMambaMoEBlock(
+                d_model=self.d_model, 
+                n_state=self.d_state, 
+                num_experts=self.num_experts, 
+                k=1  # Top-1 expert activation for sparsity
+            ) 
             for _ in range(self.n_layers)
         ])
         
-        # Mixture of Experts (MoE) Layer
-        self.moe = MoE(self.d_model, self.num_experts)
+        # Note: The standalone self.moe here is redundant if MoE is inside the block, 
+        # but kept for consistency if needed for auxiliary purposes.
+        # self.moe = MoE(self.d_model, self.num_experts)
         
-        # Final Classification Layer
+        # 3. Final Classification Head
+        # Projects the processed latent representation to the output class probabilities.
         self.fc = nn.Linear(self.d_model, self.num_classes)
         
     def forward(self, x):
-        # Project input to d_model
+        """
+        Forward pass of the model.
+        Args:
+            x: Input tensor of shape (Batch, Time, Input_Dim) or (Batch, Input_Dim, Time) depending on preprocessing.
+        """
+        # Linear Projection to d_model
         x = self.input_projection(x)
         
-        for layer in self.mamba_layers:
-            # Pass through stacked Mamba2 layers
-            x = layer(x)
-            # Pass through MoE layer    
-            x = self.moe(x)
+        # (Optional) Apply Layer Normalization
+        # x = self.layer_norm(x)
         
-        # Final classification
+        # Pass input through the stacked SparseMambaMoE Blocks
+        for layer in self.mamba_layers:
+            x = layer(x)
+        
+        # Final Classification
         x = self.fc(x)
         return x
 
+class SparseMambaMoEBlock(nn.Module):
+    """
+    A unified block containing Bi-Directional Mamba for temporal mixing 
+    and Mixture of Experts (MoE) for channel mixing (replacing standard MLP).
+    """
+    def __init__(self, d_model, n_state, num_experts, k):
+        super().__init__()
+        
+        # Normalization layer before Mamba
+        self.norm1 = nn.LayerNorm(d_model)
+        
+        # Bi-Mamba: Utilizes the Mamba SSM for sequence modeling.
+        # Note: We share the same Mamba module or use distinct ones depending on implementation.
+        # Here, we reuse the module instance but apply it bi-directionally.
+        self.mamba = Mamba(d_model, n_state) 
+        
+        # Normalization layer before MoE
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        # Mixture of Experts (MoE)
+        # Replaces the traditional dense Feed-Forward Network (FFN) to capture diverse feature patterns.
+        self.moe = MoE(d_model, num_experts, k=k)
 
+    def forward(self, x):
+        # --- Path 1: Bi-Directional Mamba (Temporal Mixing) ---
+        residual = x
+        x_norm = self.norm1(x)
+        
+        # Forward Mamba: Process sequence from t=0 to T
+        x_fwd = self.mamba(x_norm)
+        
+        # Backward Mamba: Flip sequence, process, then flip back
+        # This allows the model to capture non-causal dependencies (future context).
+        x_bwd = torch.flip(self.mamba(torch.flip(x_norm, [1])), [1])
+        
+        # Combine forward and backward outputs
+        x_mamba = x_fwd + x_bwd
+        
+        # Residual connection
+        x = residual + x_mamba
+        
+        # --- Path 2: Mixture of Experts (Channel Mixing) ---
+        residual = x
+        x_norm = self.norm2(x)
+        
+        # Pass through the sparse expert layers
+        x_moe = self.moe(x_norm)
+        
+        # Residual connection
+        return residual + x_moe
+        
+# Mixture of Experts (MoE) Layer Implementation
+class MoE(nn.Module):
+    def __init__(self, d_model, num_experts, k=1, exploration_weight=0.02):
+        """
+        Sparsely Activated Mixture of Experts Layer.
+        
+        Args:
+            d_model: Dimension of the input and output.
+            num_experts: Total number of experts available.
+            k: Number of experts to activate for each token (Top-K).
+            exploration_weight: Coefficient for the load balancing loss.
+        """
+        super(MoE, self).__init__()
+        
+        # Define a list of Expert networks (Simple MLPs)
+        self.experts = nn.ModuleList([MLP(d_model) for _ in range(num_experts)])
+        
+        # Gating Network: A linear layer to predict the "routing" probability for each expert
+        self.gating = nn.Linear(d_model, num_experts)
+        
+        self.num_experts = num_experts
+        self.k = k
+        self.exploration_weight = exploration_weight
+        self.load_balancing_loss = 0.0 # Stores auxiliary loss
+
+    def forward(self, x):
+        # 1. Gating Mechanism
+        # Compute probabilities for each expert: (Batch, Seq_Len, Num_Experts)
+        gates = torch.softmax(self.gating(x), dim=-1) 
+
+        # 2. Top-K Selection
+        # Find indices and values of the top-k highest scoring experts
+        # top_k_gates: Weights for the selected experts
+        # top_k_indices: Indices of the selected experts
+        _, top_k_indices = torch.topk(gates, self.k, dim=-1) 
+        
+        # Create a sparse mask for the selected experts
+        # scatter_(-1, indices, values): Places the top-k values back into a zero-filled tensor
+        top_k_gates = torch.zeros_like(gates).scatter_(-1, top_k_indices, gates.gather(-1, top_k_indices)) 
+
+        # 3. Expert Computation
+        # Compute output of ALL experts (Note: In optimized CUDA implementations, this would be sparse)
+        # expert_outputs shape: (Batch, Seq_Len, d_model, Num_Experts)
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=-1) 
+
+        # 4. Weighted Aggregation
+        # Sum the expert outputs weighted by the gating score (Top-K only)
+        # Einstein summation: Combine last dimension (experts)
+        output = torch.einsum('...nde,...ne->...nd', expert_outputs, top_k_gates) 
+
+        # 5. Load Balancing Loss (Auxiliary Loss)
+        # Encourages the router to use all experts equally over the batch.
+        avg_gates = gates.mean(dim=0) # Average usage of each expert in the batch
+        
+        # Entropy-based loss: Minimizes the variance of expert usage
+        load_balancing_loss = (avg_gates * torch.log(avg_gates + 1e-6)).sum() / self.num_experts 
+        self.load_balancing_loss = -self.exploration_weight * load_balancing_loss 
+
+        return output
