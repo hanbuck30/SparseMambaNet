@@ -10,7 +10,7 @@ Hanbeot Park†1, Yunjeong Cho†1, Hunhee Kim*
 ## Code Availability
 The code in this repository is currently kept private due to ongoing follow-up research.
 If you need access for academic purposes, please contact us at the address below, and we will share it upon review.
-📧 Contact: [email address]
+📧 Contact: [h2kim@pknu.ac.kr]
 
 ## Overview
 
